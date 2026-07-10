@@ -90,11 +90,118 @@ sanitize_id() {
     | sed -e 's/[^a-z0-9]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//'
 }
 
+# Return a usable icon path, following symlinks. Empty if not found.
+resolve_icon_path() {
+  local p="$1" target
+  [[ -n "$p" && ( -f "$p" || -L "$p" ) ]] || return 0
+  target="$(readlink -f "$p" 2>/dev/null || true)"
+  [[ -n "$target" && -f "$target" ]] || return 0
+  case "${target,,}" in
+    *.png|*.svg|*.xpm) printf '%s' "$target" ;;
+  esac
+}
+
+# Icon= value from a root .desktop, then usr/share/applications/*.desktop.
+desktop_icon_name() {
+  local d="$1" desktop icon
+  desktop="$(find "$d" -maxdepth 1 -name '*.desktop' \( -type f -o -type l \) 2>/dev/null \
+    | sort | head -n1 || true)"
+  if [[ -n "$desktop" ]]; then
+    icon="$(grep -m1 '^Icon=' "$desktop" 2>/dev/null | cut -d= -f2- | tr -d '\r')"
+    if [[ -n "$icon" && "$icon" != "application-x-executable" ]]; then
+      printf '%s' "$icon"
+      return
+    fi
+  fi
+  desktop="$(find "$d" \( -path '*/usr/share/applications/*.desktop' -o -path '*/share/applications/*.desktop' \) \
+    \( -type f -o -type l \) 2>/dev/null | sort | head -n1 || true)"
+  if [[ -n "$desktop" ]]; then
+    icon="$(grep -m1 '^Icon=' "$desktop" 2>/dev/null | cut -d= -f2- | tr -d '\r')"
+    if [[ -n "$icon" && "$icon" != "application-x-executable" ]]; then
+      printf '%s' "$icon"
+    fi
+  fi
+}
+
+# AppDir root icon file for a logical Icon= name (no extension per XDG spec).
+root_icon_by_name() {
+  local d="$1" name="$2" ext resolved
+  for ext in png svg xpm; do
+    resolved="$(resolve_icon_path "${d}/${name}.${ext}")"
+    [[ -n "$resolved" ]] && printf '%s' "$resolved" && return
+  done
+}
+
+# AppImage / AppDir spec: .DirIcon, then root icon matching desktop Icon=.
+find_appdir_icon() {
+  local d="$1" resolved icon_name
+  resolved="$(resolve_icon_path "${d}/.DirIcon")"
+  [[ -n "$resolved" ]] && printf '%s' "$resolved" && return
+
+  icon_name="$(desktop_icon_name "$d")"
+  if [[ -n "$icon_name" ]]; then
+    resolved="$(root_icon_by_name "$d" "$icon_name")"
+    [[ -n "$resolved" ]] && printf '%s' "$resolved"
+  fi
+}
+
+# Rank hicolor size dirs: scalable > NxN (by pixel area).
+hicolor_size_rank() {
+  local segment="$1"
+  if [[ "$segment" == "scalable" ]]; then
+    printf '1000000'
+  elif [[ "$segment" =~ ^([0-9]+)x([0-9]+)$ ]]; then
+    printf '%d' $(( BASH_REMATCH[1] * BASH_REMATCH[2] ))
+  else
+    printf '0'
+  fi
+}
+
+# Best matching icon under */share/icons/*/apps/ (largest resolution wins).
+find_hicolor_icon() {
+  local d="$1" icon_name="${2:-}" path best="" best_rank=0 rank size_dir
+  if [[ -z "$icon_name" ]]; then
+    icon_name="$(desktop_icon_name "$d")"
+  fi
+  [[ -n "$icon_name" ]] || return 0
+
+  while IFS= read -r path; do
+    [[ -f "$path" ]] || continue
+    size_dir="$(printf '%s' "$path" | sed -n 's|.*/share/icons/[^/]*/\([^/]*\)/apps/.*|\1|p')"
+    rank="$(hicolor_size_rank "$size_dir")"
+    if (( rank > best_rank )); then
+      best_rank=$rank
+      best="$path"
+    fi
+  done < <(find "$d" -type f -path '*/share/icons/*/apps/*' \
+    \( -iname "${icon_name}.png" -o -iname "${icon_name}.svg" -o -iname "${icon_name}.xpm" \) \
+    2>/dev/null | sort)
+
+  [[ -n "$best" ]] && printf '%s' "$best"
+}
+
+# Last resort: any png/svg in the tree (alphabetically first).
 first_icon_in_dir() {
   local d="$1"
+  # head closes the pipe after one line; with pipefail that SIGPIPEs sort/find on
+  # large trees (500+ icons). Swallow the pipeline status — empty output means none.
   find "$d" -type f \( -iname '*.png' -o -iname '*.svg' \) 2>/dev/null \
     | sort \
-    | head -n1
+    | head -n1 \
+    || true
+}
+
+# Search order: AppDir spec → hicolor theme → any icon file.
+find_icon_in_payload() {
+  local d="$1" found icon_name
+  found="$(find_appdir_icon "$d")"
+  [[ -n "$found" ]] && printf '%s' "$found" && return
+
+  icon_name="$(desktop_icon_name "$d")"
+  found="$(find_hicolor_icon "$d" "$icon_name")"
+  [[ -n "$found" ]] && printf '%s' "$found" && return
+
+  first_icon_in_dir "$d"
 }
 
 extract_appimage_payload() {
@@ -334,7 +441,7 @@ main() {
   extract_appimage_payload "$dest_appimage" "$TMPWORK"
 
   local found_icon
-  found_icon="$(first_icon_in_dir "$TMPWORK")"
+  found_icon="$(find_icon_in_payload "$TMPWORK")"
 
   if [[ -n "$found_icon" && -f "$found_icon" ]]; then
     local ext="${found_icon##*.}"
